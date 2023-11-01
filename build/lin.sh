@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -ex
 
 # Environment / working directories
 case ${PLATFORM} in
@@ -10,6 +10,7 @@ case ${PLATFORM} in
     PACKAGE=/packaging
     ROOT=/root
     VIPS_CPP_DEP=libvips-cpp.so.42
+    LIBVIPS_TARBALL=/packaging/libvips-v$VERSION_VIPS-patched.tar.gz
     ;;
   darwin*)
     DARWIN=true
@@ -18,6 +19,7 @@ case ${PLATFORM} in
     PACKAGE=$PWD
     ROOT=$PWD/platforms/$PLATFORM
     VIPS_CPP_DEP=libvips-cpp.42.dylib
+    LIBVIPS_TARBALL=$PWD/libvips-v$VERSION_VIPS-patched.tar.gz
     ;;
 esac
 
@@ -456,8 +458,42 @@ CFLAGS="${CFLAGS} -O3" meson setup _build --default-library=static --buildtype=r
   -Dtests=false
 meson install -C _build --tag devel
 
+# Download pdfium
+PDFIUM_VERSION=6097
+
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+if [ "$OS" = "darwin" ]; then
+    OS="mac"
+fi
+
+ARCH=$(uname -m)
+if [ "$ARCH" = "aarch64" ]; then
+    ARCH="arm64"
+fi
+
+mkdir -p $TARGET/lib/pkgconfig/
+$CURL "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F$PDFIUM_VERSION/pdfium-$OS-$ARCH.tgz" | tar xzC "$TARGET"
+cat > $TARGET/lib/pkgconfig/pdfium.pc << EOF
+     prefix=$TARGET
+     exec_prefix=\${prefix}
+     libdir=\${exec_prefix}/lib
+     includedir=\${prefix}/include
+     Name: pdfium
+     Description: pdfium
+     Version: ${PDFIUM_VERSION}
+     Requires:
+     Libs: -L\${libdir} -lpdfium
+     Cflags: -I\${includedir}
+EOF
+
+echo 'Downloaded pdfium'
+
 mkdir ${DEPS}/vips
-$CURL https://github.com/libvips/libvips/releases/download/v${VERSION_VIPS}/vips-$(without_prerelease $VERSION_VIPS).tar.xz | tar xJC ${DEPS}/vips --strip-components=1
+# $CURL https://github.com/libvips/libvips/releases/download/v${VERSION_VIPS}/vips-$(without_prerelease $VERSION_VIPS).tar.xz | tar xJC ${DEPS}/vips --strip-components=1
+
+# Use custom libvips (see https://github.com/Stravito/libvips) which contains some changes
+tar -xzf "$LIBVIPS_TARBALL" -C "$DEPS/vips"
+
 cd ${DEPS}/vips
 # Link libvips.so.42 statically into libvips-cpp.so.42
 sed -i'.bak' "s/library('vips'/static_&/" libvips/meson.build
@@ -477,7 +513,7 @@ sed -i'.bak' "/subdir('man')/{N;N;N;N;d;}" meson.build
 CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" meson setup _build --default-library=shared --buildtype=release --strip --prefix=${TARGET} ${MESON} \
   -Ddeprecated=false -Dexamples=false -Dintrospection=disabled -Dmodules=disabled -Dcfitsio=disabled -Dfftw=disabled -Djpeg-xl=disabled \
   ${WITHOUT_HIGHWAY:+-Dhighway=disabled} -Dorc=disabled -Dmagick=disabled -Dmatio=disabled -Dnifti=disabled -Dopenexr=disabled \
-  -Dopenjpeg=disabled -Dopenslide=disabled -Dpdfium=disabled -Dpoppler=disabled -Dquantizr=disabled \
+  -Dopenjpeg=disabled -Dopenslide=disabled -Dpdfium=enabled -Dpoppler=disabled -Dquantizr=disabled \
   -Dppm=false -Danalyze=false -Dradiance=false \
   ${LINUX:+-Dcpp_link_args="$LDFLAGS -Wl,-Bsymbolic-functions -Wl,--version-script=$DEPS/vips/vips.map $EXCLUDE_LIBS"}
 meson install -C _build --tag runtime,devel
@@ -487,6 +523,11 @@ rm -rf ${TARGET}/lib/{pkgconfig,.libs,*.la,cmake}
 
 mkdir ${TARGET}/lib-filtered
 mv ${TARGET}/lib/glib-2.0 ${TARGET}/lib-filtered
+
+# Make sure libpdfium.dylib is included in macos build
+if [ "$DARWIN" = true ]; then
+  mv "$TARGET/lib/libpdfium.dylib" "$TARGET/lib-filtered/"
+fi
 
 # Pack only the relevant libraries
 # Note: we can't use ldd on Linux, since that can only be executed on the target machine
@@ -573,6 +614,12 @@ $CURL -O https://raw.githubusercontent.com/lovell/sharp-libvips/main/THIRD-PARTY
 ls -al lib
 rm -rf lib
 mv lib-filtered lib
+
+if [ "$DARWIN" = true ]; then
+  # Fix link to pdfoum
+  install_name_tool -change ./libpdfium.dylib @loader_path/libpdfium.dylib "$TARGET/lib/$VIPS_CPP_DEP"
+fi
+
 tar chzf ${PACKAGE}/libvips-${VERSION_VIPS}-${PLATFORM}.tar.gz \
   include \
   lib \
